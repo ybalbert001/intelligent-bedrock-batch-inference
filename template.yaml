@@ -1,0 +1,330 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Bedrock Batch Inference Glue Job'
+
+Parameters:
+  JobName:
+    Type: String
+    Description: Name of the Glue job
+    Default: intelligent-bedrock-batch-inference
+    
+  ScriptBucketName:
+    Type: String
+    Description: S3 bucket name where the script will be stored
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub arn:aws:s3:::${ScriptBucketName}/*
+
+  GlueScriptFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import os
+
+          def handler(event, context):
+            try:
+              if event['RequestType'] in ['Create', 'Update']:
+                s3 = boto3.client('s3')
+                bucket = event['ResourceProperties']['Bucket']
+                key = event['ResourceProperties']['Key']
+                content = event['ResourceProperties']['Content']
+                
+                s3.put_object(
+                  Bucket=bucket,
+                  Key=key,
+                  Body=content,
+                  ContentType='text/x-python'
+                )
+                
+                response_data = {
+                  'Location': f's3://{bucket}/{key}'
+                }
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              elif event['RequestType'] == 'Delete':
+                s3 = boto3.client('s3')
+                bucket = event['ResourceProperties']['Bucket']
+                key = event['ResourceProperties']['Key']
+                
+                s3.delete_object(
+                  Bucket=bucket,
+                  Key=key
+                )
+                
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+            except Exception as e:
+              cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+      Timeout: 30
+      MemorySize: 128
+
+  GlueScript:
+    Type: Custom::S3Object
+    Properties:
+      ServiceToken: !GetAtt GlueScriptFunction.Arn
+      Bucket: !Ref ScriptBucketName
+      Key: !Sub ${JobName}/glue_bedrock_batch_inference.py
+      Content: !Sub |
+        #!/usr/bin/env python3
+        import sys
+        import json
+        import boto3
+        import argparse
+        from typing import Dict, List
+        from concurrent.futures import ThreadPoolExecutor
+        from functools import wraps
+        from math import floor
+        import time
+        import sys
+        import threading
+        from awsglue.utils import getResolvedOptions
+
+        # Use monotonic time if available, otherwise fall back to the system clock.
+        now = time.monotonic if hasattr(time, 'monotonic') else time.time
+
+        class RateLimitException(Exception):
+            def __init__(self, message, period_remaining):
+                super(RateLimitException, self).__init__(message)
+                self.period_remaining = period_remaining
+
+        class RateLimitDecorator(object):
+            def __init__(self, calls=15, period=900, clock=now, raise_on_limit=True):
+                self.clamped_calls = max(1, min(sys.maxsize, floor(calls)))
+                self.period = period
+                self.clock = clock
+                self.raise_on_limit = raise_on_limit
+                self.last_reset = clock()
+                self.num_calls = 0
+                self.lock = threading.RLock()
+
+            def __call__(self, func):
+                @wraps(func)
+                def wrapper(*args, **kargs):
+                    with self.lock:
+                        period_remaining = self.__period_remaining()
+                        if period_remaining <= 0:
+                            self.num_calls = 0
+                            self.last_reset = self.clock()
+                        self.num_calls += 1
+                        if self.num_calls > self.clamped_calls:
+                            if self.raise_on_limit:
+                                raise RateLimitException('too many calls', period_remaining)
+                            return
+                    return func(*args, **kargs)
+                return wrapper
+
+            def __period_remaining(self):
+                elapsed = self.clock() - self.last_reset
+                return self.period - elapsed
+
+        limits = RateLimitDecorator
+
+        def sleep_and_retry(func):
+            @wraps(func)
+            def wrapper(*args, **kargs):
+                while True:
+                    try:
+                        return func(*args, **kargs)
+                    except RateLimitException as exception:
+                        time.sleep(exception.period_remaining)
+            return wrapper
+
+        class BedrockBatchInference:
+            _rate_limiter = None
+            _rate_limiter_lock = threading.Lock()
+            _call_count = 0
+            _last_call_time = time.time()
+
+            def __init__(self, model_id: str, rpm: int, region:str, ak:str, sk:str):
+                print(f"ak: {ak}")
+                print(f"sk: {sk}")
+                print(f"region: {region}")
+                self.bedrock = boto3.client('bedrock-runtime', region_name=region, aws_access_key_id=ak, aws_secret_access_key=sk)
+                self.model_id = model_id
+                self.rpm = rpm
+                
+                with self._rate_limiter_lock:
+                    if BedrockBatchInference._rate_limiter is None:
+                        BedrockBatchInference._rate_limiter = limits(calls=rpm, period=60)
+                        print(f"Initialized rate limiter with {rpm} calls per minute")
+                
+                self._rate_limited_invoke = sleep_and_retry(BedrockBatchInference._rate_limiter(self._invoke_model))
+
+            def invoke_model_with_rate_limit(self, record: Dict) -> Dict:
+                with self._rate_limiter_lock:
+                    current_time = time.time()
+                    BedrockBatchInference._call_count += 1
+                    
+                    if (BedrockBatchInference._call_count - 1) % self.rpm == 0:
+                        elapsed = current_time - BedrockBatchInference._last_call_time
+                        print(f"\nStarting new RPM cycle at call {BedrockBatchInference._call_count}")
+                        print(f"Time since last cycle: {elapsed:.2f}s")
+                        
+                        if elapsed < 60:
+                            sleep_time = 60 - elapsed
+                            print(f"Rate limit reached, sleeping for {sleep_time:.2f}s to start new cycle")
+                            time.sleep(sleep_time)
+                        
+                        current_time = time.time()
+                        BedrockBatchInference._last_call_time = current_time
+                        elapsed = 0
+                    else:
+                        elapsed = current_time - BedrockBatchInference._last_call_time
+                    
+                    print(f"Call {BedrockBatchInference._call_count} - Time since cycle start: {elapsed:.2f}s")
+                
+                return self._rate_limited_invoke(record)
+
+            def _invoke_model(self, record: Dict) -> Dict:
+                try:
+                    model_input = record.get('modelInput', {})
+                    if not model_input:
+                        raise ValueError("No model input found in the record.")
+
+                    print(f"Processing record {record.get('recordId', 'unknown')} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"Current thread: {threading.current_thread().name}")
+                    with self._rate_limiter.lock:
+                        period_remaining = self._rate_limiter.period - (self._rate_limiter.clock() - self._rate_limiter.last_reset)
+                        print(f"Rate limiter state - calls: {self._rate_limiter.num_calls}, period remaining: {period_remaining:.2f}s")
+                    
+                    payload = json.dumps(model_input)
+                    response = self.bedrock.invoke_model(
+                        modelId=self.model_id,
+                        body=payload
+                    )
+                    
+                    response_body = json.loads(response.get('body').read())
+                    print(f"Successfully processed record {record.get('recordId', 'unknown')}")
+                    return {
+                        'modelInput': model_input,
+                        'modelOutput': response_body,
+                        'recordId': record.get('recordId', '')
+                    }
+                except Exception as e:
+                    print(f"exception: {e}")
+                    return {
+                        'modelInput': model_input,
+                        'modelOutput': {
+                            'error': str(e)
+                        },
+                        'recordId': record.get('recordId', '')
+                    }
+
+            def process_batch(self, records: List[Dict], max_workers: int) -> List[Dict]:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    return list(executor.map(self.invoke_model_with_rate_limit, records))
+
+        def read_jsonl(s3_path: str) -> List[Dict]:
+            s3 = boto3.client('s3')
+            bucket, key = s3_path.replace('s3://', '').split('/', 1)
+            response = s3.get_object(Bucket=bucket, Key=key)
+            return [json.loads(line) for line in response['Body'].read().decode('utf-8').splitlines()]
+
+        def write_jsonl(data: List[Dict], s3_path: str):
+            s3 = boto3.client('s3')
+            bucket, key = s3_path.replace('s3://', '').split('/', 1)
+            content = '\n'.join(json.dumps(record, ensure_ascii=False) for record in data)
+            s3.put_object(Bucket=bucket, Key=key, Body=content.encode('utf-8'))
+
+        def main():
+            args = getResolvedOptions(sys.argv, ['input_path', 'output_path', 'model_id', 'rpm', 'max_worker', 'ak', 'sk', 'region'])
+            input_path = args['input_path']
+            output_path = args['output_path']
+            model_id = args['model_id']
+            rpm = int(args['rpm'])
+            max_worker = int(args.get('max_worker', 10))
+            ak = args['ak']
+            sk = args['sk']
+            region = args['region']
+
+            processor = BedrockBatchInference(model_id, rpm, region, ak, sk)
+            
+            try:
+                print(f"Reading input data from {input_path}")
+                all_records = read_jsonl(input_path)
+                records = all_records[:1000]
+                
+                print(f"Processing {len(records)} records...")
+                results = processor.process_batch(records, max_worker)
+                
+                print(f"Writing results to {output_path}")
+                write_jsonl(results, output_path)
+                
+                print("Processing completed successfully")
+                
+            except Exception as e:
+                print(f"Error during processing: {str(e)}")
+                sys.exit(1)
+
+        if __name__ == '__main__':
+            main()
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'GlueBedockBatchInferenceRole-${AWS::AccountId}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+
+  GlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Ref JobName
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: pythonshell
+        ScriptLocation: !Sub s3://${ScriptBucketName}/${JobName}/glue_bedrock_batch_inference.py
+        PythonVersion: '3.9'
+      DefaultArguments:
+        '--enable-metrics': ''
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--additional-python-modules': 'boto3>=1.35.87,botocore>=1.35.87'
+      MaxRetries: 0
+      Timeout: 10080
+      GlueVersion: '3.0'
+      MaxCapacity: 1.0
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+
+Outputs:
+  GlueJobName:
+    Description: Name of the created Glue job
+    Value: !Ref GlueJob
+
+  GlueJobRoleArn:
+    Description: ARN of the IAM role created for the Glue job
+    Value: !GetAtt GlueJobRole.Arn
