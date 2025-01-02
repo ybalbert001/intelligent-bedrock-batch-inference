@@ -97,6 +97,7 @@ Resources:
         import argparse
         from typing import Dict, List
         from concurrent.futures import ThreadPoolExecutor
+
         from functools import wraps
         from math import floor
         import time
@@ -108,45 +109,121 @@ Resources:
         now = time.monotonic if hasattr(time, 'monotonic') else time.time
 
         class RateLimitException(Exception):
+            '''
+            Rate limit exception class.
+            '''
             def __init__(self, message, period_remaining):
+                '''
+                Custom exception raise when the number of function invocations exceeds
+                that imposed by a rate limit. Additionally the exception is aware of
+                the remaining time period after which the rate limit is reset.
+
+                :param string message: Custom exception message.
+                :param float period_remaining: The time remaining until the rate limit is reset.
+                '''
                 super(RateLimitException, self).__init__(message)
                 self.period_remaining = period_remaining
 
         class RateLimitDecorator(object):
+            '''
+            Rate limit decorator class.
+            '''
             def __init__(self, calls=15, period=900, clock=now, raise_on_limit=True):
+                '''
+                Instantiate a RateLimitDecorator with some sensible defaults. By
+                default the Twitter rate limiting window is respected (15 calls every
+                15 minutes).
+
+                :param int calls: Maximum function invocations allowed within a time period. Must be a number greater than 0.
+                :param float period: An upper bound time period (in seconds) before the rate limit resets. Must be a number greater than 0.
+                :param function clock: An optional function retuning the current time. This is used primarily for testing.
+                :param bool raise_on_limit: A boolean allowing the caller to avoiding rasing an exception.
+                '''
                 self.clamped_calls = max(1, min(sys.maxsize, floor(calls)))
                 self.period = period
                 self.clock = clock
                 self.raise_on_limit = raise_on_limit
+
+                # Initialise the decorator state.
                 self.last_reset = clock()
                 self.num_calls = 0
+
+                # Add thread safety.
                 self.lock = threading.RLock()
 
             def __call__(self, func):
+                '''
+                Return a wrapped function that prevents further function invocations if
+                previously called within a specified period of time.
+
+                :param function func: The function to decorate.
+                :return: Decorated function.
+                :rtype: function
+                '''
                 @wraps(func)
                 def wrapper(*args, **kargs):
+                    '''
+                    Extend the behaviour of the decoated function, forwarding function
+                    invocations previously called no sooner than a specified period of
+                    time. The decorator will raise an exception if the function cannot
+                    be called so the caller may implement a retry strategy such as an
+                    exponential backoff.
+
+                    :param args: non-keyword variable length argument list to the decorated function.
+                    :param kargs: keyworded variable length argument list to the decorated function.
+                    :raises: RateLimitException
+                    '''
                     with self.lock:
                         period_remaining = self.__period_remaining()
+
+                        # If the time window has elapsed then reset.
                         if period_remaining <= 0:
                             self.num_calls = 0
                             self.last_reset = self.clock()
+
+                        # Increase the number of attempts to call the function.
                         self.num_calls += 1
+
+                        # If the number of attempts to call the function exceeds the
+                        # maximum then raise an exception.
                         if self.num_calls > self.clamped_calls:
                             if self.raise_on_limit:
                                 raise RateLimitException('too many calls', period_remaining)
                             return
+
                     return func(*args, **kargs)
                 return wrapper
 
             def __period_remaining(self):
+                '''
+                Return the period remaining for the current rate limit window.
+
+                :return: The remaing period.
+                :rtype: float
+                '''
                 elapsed = self.clock() - self.last_reset
                 return self.period - elapsed
 
         limits = RateLimitDecorator
 
         def sleep_and_retry(func):
+            '''
+            Return a wrapped function that rescues rate limit exceptions, sleeping the
+            current thread until rate limit resets.
+
+            :param function func: The function to decorate.
+            :return: Decorated function.
+            :rtype: function
+            '''
             @wraps(func)
             def wrapper(*args, **kargs):
+                '''
+                Call the rate limited function. If the function raises a rate limit
+                exception sleep for the remaing time period and retry the function.
+
+                :param args: non-keyword variable length argument list to the decorated function.
+                :param kargs: keyworded variable length argument list to the decorated function.
+                '''
                 while True:
                     try:
                         return func(*args, **kargs)
@@ -155,12 +232,14 @@ Resources:
             return wrapper
 
         class BedrockBatchInference:
+            # Class-level rate limiter to ensure it's shared across all instances and threads
             _rate_limiter = None
             _rate_limiter_lock = threading.Lock()
             _call_count = 0
             _last_call_time = time.time()
 
             def __init__(self, model_id: str, rpm: int, region:str, ak:str, sk:str):
+                """Initialize the batch inference processor"""
                 print(f"ak: {ak}")
                 print(f"sk: {sk}")
                 print(f"region: {region}")
@@ -168,58 +247,72 @@ Resources:
                 self.model_id = model_id
                 self.rpm = rpm
                 
+                # Initialize or get the shared rate limiter
                 with self._rate_limiter_lock:
                     if BedrockBatchInference._rate_limiter is None:
                         BedrockBatchInference._rate_limiter = limits(calls=rpm, period=60)
                         print(f"Initialized rate limiter with {rpm} calls per minute")
                 
+                # Create rate-limited invoke function for this instance
                 self._rate_limited_invoke = sleep_and_retry(BedrockBatchInference._rate_limiter(self._invoke_model))
 
             def invoke_model_with_rate_limit(self, record: Dict) -> Dict:
+                """Process a single record through Bedrock's model with rate limiting"""
                 with self._rate_limiter_lock:
                     current_time = time.time()
                     BedrockBatchInference._call_count += 1
                     
+                    # If this is the first call in a new RPM cycle
                     if (BedrockBatchInference._call_count - 1) % self.rpm == 0:
                         elapsed = current_time - BedrockBatchInference._last_call_time
                         print(f"\nStarting new RPM cycle at call {BedrockBatchInference._call_count}")
                         print(f"Time since last cycle: {elapsed:.2f}s")
                         
+                        # If we're starting a new cycle too soon, sleep until the full minute has passed
                         if elapsed < 60:
                             sleep_time = 60 - elapsed
                             print(f"Rate limit reached, sleeping for {sleep_time:.2f}s to start new cycle")
                             time.sleep(sleep_time)
                         
+                        # Update times after potential sleep
                         current_time = time.time()
                         BedrockBatchInference._last_call_time = current_time
-                        elapsed = 0
+                        elapsed = 0  # Reset elapsed time since this is the start of a new cycle
                     else:
+                        # Calculate elapsed time since cycle start
                         elapsed = current_time - BedrockBatchInference._last_call_time
                     
+                    # Log the call details
                     print(f"Call {BedrockBatchInference._call_count} - Time since cycle start: {elapsed:.2f}s")
                 
                 return self._rate_limited_invoke(record)
 
             def _invoke_model(self, record: Dict) -> Dict:
+                """Internal method to invoke the Bedrock model with the given record"""
                 try:
+                    # Extract the model input from the record
                     model_input = record.get('modelInput', {})
                     if not model_input:
                         raise ValueError("No model input found in the record.")
 
+                    # Log request details
                     print(f"Processing record {record.get('recordId', 'unknown')} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
                     print(f"Current thread: {threading.current_thread().name}")
                     with self._rate_limiter.lock:
                         period_remaining = self._rate_limiter.period - (self._rate_limiter.clock() - self._rate_limiter.last_reset)
                         print(f"Rate limiter state - calls: {self._rate_limiter.num_calls}, period remaining: {period_remaining:.2f}s")
                     
+                    # Prepare and send request
                     payload = json.dumps(model_input)
                     response = self.bedrock.invoke_model(
                         modelId=self.model_id,
                         body=payload
                     )
                     
+                    # Parse and log response
                     response_body = json.loads(response.get('body').read())
                     print(f"Successfully processed record {record.get('recordId', 'unknown')}")
+                    # Construct the output following the inference output schema
                     return {
                         'modelInput': model_input,
                         'modelOutput': response_body,
@@ -236,25 +329,38 @@ Resources:
                     }
 
             def process_batch(self, records: List[Dict], max_workers: int) -> List[Dict]:
+                """Process a batch of records using thread pool"""
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     return list(executor.map(self.invoke_model_with_rate_limit, records))
 
         def read_jsonl(s3_path: str) -> List[Dict]:
+            """Read JSONL data from S3"""
             s3 = boto3.client('s3')
             bucket, key = s3_path.replace('s3://', '').split('/', 1)
             response = s3.get_object(Bucket=bucket, Key=key)
-            return [json.loads(line) for line in response['Body'].read().decode('utf-8').splitlines()]
+            result = []
+            for line_number, line in enumerate(response['Body'].read().decode('utf-8').splitlines(), 1):
+                try:
+                    parsed_line = json.loads(line)
+                    result.append(parsed_line)
+                except json.JSONDecodeError as e:
+                    print(f"Warning: Failed to parse JSON at line {line_number}. Error: {str(e)}")
+                    print(f"Problematic line: {line}")
+                    continue
+            return result
 
         def write_jsonl(data: List[Dict], s3_path: str):
+            """Write JSONL data to S3"""
             s3 = boto3.client('s3')
             bucket, key = s3_path.replace('s3://', '').split('/', 1)
             content = '\n'.join(json.dumps(record, ensure_ascii=False) for record in data)
             s3.put_object(Bucket=bucket, Key=key, Body=content.encode('utf-8'))
 
         def main():
-            args = getResolvedOptions(sys.argv, ['input_path', 'output_path', 'model_id', 'rpm', 'max_worker', 'ak', 'sk', 'region'])
-            input_path = args['input_path']
-            output_path = args['output_path']
+            """Main execution function"""
+            args = getResolvedOptions(sys.argv, ['input_s3_uri_list', 'output_s3_uri', 'model_id', 'rpm', 'max_worker', 'ak', 'sk', 'region'])
+            input_s3_uri_list = args['input_s3_uri_list'].split(',')  # Parse JSON string to list
+            output_path = args['output_s3_uri']
             model_id = args['model_id']
             rpm = int(args['rpm'])
             max_worker = int(args.get('max_worker', 10))
@@ -262,18 +368,32 @@ Resources:
             sk = args['sk']
             region = args['region']
 
+            # Initialize processor
             processor = BedrockBatchInference(model_id, rpm, region, ak, sk)
             
             try:
-                print(f"Reading input data from {input_path}")
-                all_records = read_jsonl(input_path)
-                records = all_records[:1000]
+                print(f"Processing {len(input_s3_uri_list)} input files")
                 
-                print(f"Processing {len(records)} records...")
-                results = processor.process_batch(records, max_worker)
-                
-                print(f"Writing results to {output_path}")
-                write_jsonl(results, output_path)
+                # Process each input file
+                for input_uri in input_s3_uri_list:
+                    if not input_uri.endswith('.jsonl'):
+                        print(f"Warning: Skipping {input_uri} as it's not a JSONL file")
+                        continue
+                        
+                    # Generate output path by appending .out to the input filename
+                    file_name = input_uri.split('/')[-1]
+                    output_bucket, output_prefix = output_path.replace('s3://', '').split('/', 1)
+                    if not output_prefix.endswith('/'):
+                        output_prefix += '/'
+                    current_output_path = f"s3://{output_bucket}/{output_prefix}{file_name}.out"
+                    
+                    print(f"\nProcessing file: {input_uri}")
+                    print(f"Output will be written to: {current_output_path}")
+                    
+                    all_records = read_jsonl(input_uri)
+                    records = all_records
+                    results = processor.process_batch(records, max_worker)
+                    write_jsonl(results, current_output_path)
                 
                 print("Processing completed successfully")
                 
