@@ -380,7 +380,7 @@ def main():
             file_name = input_uri.split('/')[-1]
             job_id = f"job_{idx}"
             ts = time.time()
-            execute_id = str(ts).replace('.','-')[-10:]
+            execute_id = str(ts).replace('.','-')[:10]
             output_bucket, output_prefix = output_path.replace('s3://', '').split('/', 1)
             if not output_prefix.endswith('/'):
                 output_prefix += '/'

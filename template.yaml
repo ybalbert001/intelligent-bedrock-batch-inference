@@ -375,17 +375,20 @@ Resources:
                 print(f"Processing {len(input_s3_uri_list)} input files")
                 
                 # Process each input file
-                for input_uri in input_s3_uri_list:
+                for idx, input_uri in enumerate(input_s3_uri_list):
                     if not input_uri.endswith('.jsonl'):
                         print(f"Warning: Skipping {input_uri} as it's not a JSONL file")
                         continue
                         
                     # Generate output path by appending .out to the input filename
                     file_name = input_uri.split('/')[-1]
+                    job_id = f"job_{idx}"
+                    ts = time.time()
+                    execute_id = str(ts).replace('.','-')[:10]
                     output_bucket, output_prefix = output_path.replace('s3://', '').split('/', 1)
                     if not output_prefix.endswith('/'):
                         output_prefix += '/'
-                    current_output_path = f"s3://{output_bucket}/{output_prefix}{file_name}.out"
+                    current_output_path = f"s3://{output_bucket}/{output_prefix}{job_id}/{execute_id}/{file_name}.out"
                     
                     print(f"\nProcessing file: {input_uri}")
                     print(f"Output will be written to: {current_output_path}")
