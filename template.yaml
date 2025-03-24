@@ -95,6 +95,8 @@ Resources:
         import json
         import boto3
         import argparse
+        import hashlib
+        import requests
         from typing import Dict, List
         from concurrent.futures import ThreadPoolExecutor
 
@@ -238,6 +240,23 @@ Resources:
             _call_count = 0
             _last_call_time = time.time()
 
+
+            def __init__(self, workflow_api_url:str, workflow_api_key:str, rpm: int):
+                print(f"workflow_api_url: {workflow_api_url}")
+                print(f"workflow_api_key: {workflow_api_key}")
+                self.workflow_api_url = workflow_api_url
+                self.workflow_api_key = workflow_api_key
+
+                # Initialize or get the shared rate limiter
+                with self._rate_limiter_lock:
+                    if BedrockBatchInference._rate_limiter is None:
+                        BedrockBatchInference._rate_limiter = limits(calls=rpm, period=60)
+                        print(f"Initialized rate limiter with {rpm} calls per minute")
+                
+                # Create rate-limited invoke function for this instance
+                self._rate_limited_invoke = sleep_and_retry(BedrockBatchInference._rate_limiter(self._invoke_dify_workflow))
+
+
             def __init__(self, model_id: str, rpm: int, region:str, ak:str, sk:str):
                 """Initialize the batch inference processor"""
                 print(f"ak: {ak}")
@@ -327,7 +346,43 @@ Resources:
                         },
                         'recordId': record.get('recordId', '')
                     }
-
+                
+            def _invoke_dify_workflow(self, record: Dict)-> Dict:
+                try:
+                    record_id = hashlib.sha256(record).hexdigest()
+                    headers = {
+                        "Authorization": f"Bearer {self.workflow_api_key}", 
+                        "Content-Type": "application/json"
+                    }
+                    payload = {
+                        "inputs": record,
+                        "response_mode": "blocking",
+                        "user": "batch_inference"
+                    }
+                    # Log request details
+                    print(f"Processing record {record_id} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"Current thread: {threading.current_thread().name}")
+                    with self._rate_limiter.lock:
+                        period_remaining = self._rate_limiter.period - (self._rate_limiter.clock() - self._rate_limiter.last_reset)
+                        print(f"Rate limiter state - calls: {self._rate_limiter.num_calls}, period remaining: {period_remaining:.2f}s")
+                    
+                    response = requests.post(self.workflow_api_url, headers=headers, data=json.dumps(payload))
+                    result = response.json()
+                    return {
+                        'modelInput': record,
+                        'modelOutput': result["data"]['outputs'],
+                        'recordId': record_id
+                    }
+                except Exception as e:
+                    print(f"exception: {e}")
+                    return {
+                        'modelInput': record,
+                        'modelOutput': {
+                            'error': str(e)
+                        },
+                        'recordId': record_id
+                    }
+                
             def process_batch(self, records: List[Dict], max_workers: int) -> List[Dict]:
                 """Process a batch of records using thread pool"""
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -358,19 +413,25 @@ Resources:
 
         def main():
             """Main execution function"""
-            args = getResolvedOptions(sys.argv, ['input_s3_uri_list', 'output_s3_uri', 'model_id', 'rpm', 'max_worker', 'ak', 'sk', 'region'])
+            args = getResolvedOptions(sys.argv, ['input_s3_uri_list', 'output_s3_uri', 'model_id', 'rpm', 'max_worker', 'ak', 'sk', 'region', 'dify_workflow_url', 'dify_workflow_key'])
             input_s3_uri_list = args['input_s3_uri_list'].split(',')  # Parse JSON string to list
             output_path = args['output_s3_uri']
-            model_id = args['model_id']
+            model_id = args.get('model_id')
+            dify_workflow_url = args.get('dify_workflow_url')
+            dify_workflow_key = args.get('dify_workflow_key')
             rpm = int(args['rpm'])
             max_worker = int(args.get('max_worker', 10))
-            ak = args['ak']
-            sk = args['sk']
-            region = args['region']
+            ak = args.get('ak')
+            sk = args.get('sk')
+            region = args.get('region')
 
             # Initialize processor
-            processor = BedrockBatchInference(model_id, rpm, region, ak, sk)
-            
+            if model_id and region and ak and sk:
+                processor = BedrockBatchInference(model_id=model_id, rpm=rpm, region=region, ak=ak, sk=sk)
+            elif dify_workflow_url and dify_workflow_key:
+                processor = BedrockBatchInference(workflow_api_url=dify_workflow_url, workflow_api_key=dify_workflow_key, rpm=rpm)
+            else:
+                raise ValueError("unsupported job type, Please check the parameters.")
             try:
                 print(f"Processing {len(input_s3_uri_list)} input files")
                 
@@ -435,7 +496,7 @@ Resources:
       DefaultArguments:
         '--enable-metrics': ''
         '--enable-continuous-cloudwatch-log': 'true'
-        '--additional-python-modules': 'boto3>=1.35.87,botocore>=1.35.87'
+        '--additional-python-modules': 'boto3>=1.35.87,botocore>=1.35.87,requests==2.32.3'
       MaxRetries: 0
       Timeout: 10080
       GlueVersion: '3.0'

@@ -1,14 +1,14 @@
 # Intelligent Bedrock Batch Inference
 
-This implementation provides a scalable solution for running batch inference using Amazon Bedrock through AWS Glue. The solution processes JSONL files from S3 and controls the rate of API calls to Bedrock.
+本项目通过AWS Glue服务实现了可扩展的运行批量推理的方案。它处理S3上的JSONL文件作为输入，把推理结果输出到S3的指定路径中。该方案可以通过设定rpm来控制推理的速率和并发。
 
 ## Usage
 
-1. Open AWS Console, navigate to Cloudformation, create stack by **template.yaml**
+1. 打开AWS Console, 选择Cloudformation服务, 用文件**template.yaml**模版一键部署。
 
-2. Run the Glue Job
+2. 运行Glue job进行批量推理
 
-- InvokeModel BatchInference (For Single s3_uri)
+- 模型批量推理 (单S3_URI输入)
 ```bash
 aws glue start-job-run \
     --job-name intelligent-bedrock-batch-inference \
@@ -24,7 +24,7 @@ aws glue start-job-run \
     }'
 ```
 
-- InvokeModel BatchInference (For multiple s3_uri)
+- 模型批量推理 (多S3_URI输入)
 ```bash
 aws glue start-job-run \
     --job-name intelligent-bedrock-batch-inference \
@@ -40,7 +40,7 @@ aws glue start-job-run \
     }'
 ```
 
-- InvokeDifyWorkflow BatchInference (For single s3_uri)
+- Dify工作流批量推理(单S3_URI输入)
 ```bash
 aws glue start-job-run \
     --job-name intelligent-bedrock-batch-inference \
@@ -54,9 +54,9 @@ aws glue start-job-run \
     }'
 ```
 
-### Parameters
+### 参数
 
-- `input_s3_uri_list`: S3 path list which provide input JSONL files, splited by ,
-- `output_s3_uri`: S3 path for output results
-- `model_id`: Bedrock model ID to use
-- `rpm`: Requests per minute limit (adjust based on your quota)
+- `input_s3_uri_list`: s3输入列表，用','分隔
+- `output_s3_uri`: s3输出路径
+- `model_id`: 采样的Bedrock model ID
+- `rpm`: 每分钟请求数限制
