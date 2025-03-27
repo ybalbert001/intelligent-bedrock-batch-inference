@@ -1,0 +1,14 @@
+version: '3'
+
+services:
+  streamlit:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - ~/.aws:/root/.aws:ro  # Mount AWS credentials (read-only)
+      - ./app.py:/app/app.py  # Mount app.py for live updates
+    environment:
+      - AWS_PROFILE=${AWS_PROFILE:-default}  # Use default profile if not specified
+      - AWS_REGION=${AWS_REGION:-us-west-2}  # Use us-west-2 if not specified
+    restart: unless-stopped

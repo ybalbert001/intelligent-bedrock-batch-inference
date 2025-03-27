@@ -204,40 +204,32 @@ class BedrockBatchInference:
     _call_count = 0
     _last_call_time = time.time()
 
-
-    def __init__(self, workflow_api_url:str, workflow_api_key:str, rpm: int):
-        print(f"workflow_api_url: {workflow_api_url}")
-        print(f"workflow_api_key: {workflow_api_key}")
-        self.workflow_api_url = workflow_api_url
-        self.workflow_api_key = workflow_api_key
-
-        # Initialize or get the shared rate limiter
-        with self._rate_limiter_lock:
-            if BedrockBatchInference._rate_limiter is None:
-                BedrockBatchInference._rate_limiter = limits(calls=rpm, period=60)
-                print(f"Initialized rate limiter with {rpm} calls per minute")
-        
-        # Create rate-limited invoke function for this instance
-        self._rate_limited_invoke = sleep_and_retry(BedrockBatchInference._rate_limiter(self._invoke_dify_workflow))
-
-
-    def __init__(self, model_id: str, rpm: int, region:str, ak:str, sk:str):
+    def __init__(self, model_id: str, rpm: int, region:str, ak:str, sk:str, workflow_api_url:str, workflow_api_key:str):
         """Initialize the batch inference processor"""
-        print(f"ak: {ak}")
-        print(f"sk: {sk}")
-        print(f"region: {region}")
-        self.bedrock = boto3.client('bedrock-runtime', region_name=region, aws_access_key_id=ak, aws_secret_access_key=sk)
-        self.model_id = model_id
-        self.rpm = rpm
-        
         # Initialize or get the shared rate limiter
         with self._rate_limiter_lock:
             if BedrockBatchInference._rate_limiter is None:
                 BedrockBatchInference._rate_limiter = limits(calls=rpm, period=60)
                 print(f"Initialized rate limiter with {rpm} calls per minute")
-        
-        # Create rate-limited invoke function for this instance
-        self._rate_limited_invoke = sleep_and_retry(BedrockBatchInference._rate_limiter(self._invoke_model))
+
+        if '?' not in [workflow_api_url, workflow_api_key]:
+            print(f"workflow_api_url: {workflow_api_url}")
+            print(f"workflow_api_key: {workflow_api_key}")
+            self.workflow_api_url = workflow_api_url
+            self.workflow_api_key = workflow_api_key
+            self.rpm = rpm
+            self._rate_limited_invoke = sleep_and_retry(BedrockBatchInference._rate_limiter(self._invoke_dify_workflow))
+
+        elif '?' not in [model_id, region, ak, sk]:
+            print(f"ak: {ak}")
+            print(f"sk: {sk}")
+            print(f"region: {region}")
+            self.bedrock = boto3.client('bedrock-runtime', region_name=region, aws_access_key_id=ak, aws_secret_access_key=sk)
+            self.model_id = model_id
+            self.rpm = rpm
+            self._rate_limited_invoke = sleep_and_retry(BedrockBatchInference._rate_limiter(self._invoke_model))
+        else:
+            raise ValueError("unsupported job type, Please check the parameters.")
 
     def invoke_model_with_rate_limit(self, record: Dict) -> Dict:
         """Process a single record through Bedrock's model with rate limiting"""
@@ -313,7 +305,7 @@ class BedrockBatchInference:
         
     def _invoke_dify_workflow(self, record: Dict)-> Dict:
         try:
-            record_id = hashlib.sha256(record).hexdigest()
+            record_id = hashlib.sha256(json.dumps(record).encode('utf-8')).hexdigest()
             headers = {
                 "Authorization": f"Bearer {self.workflow_api_key}", 
                 "Content-Type": "application/json"
@@ -332,6 +324,8 @@ class BedrockBatchInference:
             
             response = requests.post(self.workflow_api_url, headers=headers, data=json.dumps(payload))
             result = response.json()
+            print("result:")
+            print(result)
             return {
                 'modelInput': record,
                 'modelOutput': result["data"]['outputs'],
@@ -378,10 +372,10 @@ def write_jsonl(data: List[Dict], s3_path: str):
 def main():
     """Main execution function"""
     # parser = argparse.ArgumentParser(description='Process CSV files for translation')
-    # parser.add_argument('--input_path', type=str, default='zh-cn',
-    #                   help='Target language for translation (default: zh-cn)')
-    # parser.add_argument('--output_path', type=str, default='claude',
-    #                   help='Target model : claude')
+    # parser.add_argument('--input_path', type=str, default='',
+    #                   help='input path')
+    # parser.add_argument('--output_path', type=str, default='',
+    #                   help='input dir')
     # parser.add_argument('--model_id', type=str, default='claude',
     #                 help='Target model : claude')
     # parser.add_argument('--rpm', type=int, default=20,
@@ -392,6 +386,10 @@ def main():
     #                 help='access key for aws')
     # parser.add_argument('--sk', type=str, default='',
     #                 help='secret key for aws')
+    # parser.add_argument('--dify_workflow_url', type=str, default='',
+    #                 help='dify workflow url')
+    # parser.add_argument('--dify_workflow_key', type=str, default='',
+    #                 help='dify workflow key')
     # parser.add_argument('--region', type=str, default='',
     #                 help='region')
     # args = parser.parse_args()
@@ -404,6 +402,8 @@ def main():
     # ak = args.ak
     # sk = args.sk
     # region = args.region
+    # dify_workflow_url = args.dify_workflow_url
+    # dify_workflow_key = args.dify_workflow_key
 
     args = getResolvedOptions(sys.argv, ['input_s3_uri_list', 'output_s3_uri', 'model_id', 'rpm', 'max_worker', 'ak', 'sk', 'region', 'dify_workflow_url', 'dify_workflow_key'])
     input_s3_uri_list = args['input_s3_uri_list'].split(',')  # Parse JSON string to list
@@ -418,12 +418,8 @@ def main():
     region = args.get('region')
 
     # Initialize processor
-    if model_id and region and ak and sk:
-        processor = BedrockBatchInference(model_id=model_id, rpm=rpm, region=region, ak=ak, sk=sk)
-    elif dify_workflow_url and dify_workflow_key:
-        processor = BedrockBatchInference(workflow_api_url=dify_workflow_url, workflow_api_key=dify_workflow_key, rpm=rpm)
-    else:
-        raise ValueError("unsupported job type, Please check the parameters.")
+    processor = BedrockBatchInference(workflow_api_url=dify_workflow_url, workflow_api_key=dify_workflow_key, model_id=model_id, rpm=rpm, region=region, ak=ak, sk=sk)
+
     try:
         print(f"Processing {len(input_s3_uri_list)} input files")
         
