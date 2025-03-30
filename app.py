@@ -4,6 +4,7 @@ import json
 import boto3
 import pandas as pd
 import os
+import sqlite3
 from datetime import datetime
 
 # Set page configuration
@@ -13,11 +14,43 @@ st.set_page_config(
     layout="wide"
 )
 
+# SQLite database setup
+DB_PATH = "jobs.db"
+
+def init_db():
+    """Initialize the SQLite database with required tables if they don't exist"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Create jobs table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS jobs (
+        job_id TEXT PRIMARY KEY,
+        job_name TEXT NOT NULL,
+        start_time TEXT NOT NULL,
+        status TEXT NOT NULL,
+        args TEXT NOT NULL
+    )
+    ''')
+    
+    # Create output_files table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS output_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        file_size TEXT NOT NULL,
+        FOREIGN KEY (job_id) REFERENCES jobs (job_id)
+    )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+# Initialize database
+init_db()
+
 # Initialize session state variables if they don't exist
-if 'jobs' not in st.session_state:
-    st.session_state.jobs = []
-if 'job_details' not in st.session_state:
-    st.session_state.job_details = {}
 if 'job_type' not in st.session_state:
     st.session_state.job_type = "InvokeModel"
 
@@ -54,6 +87,98 @@ def run_aws_command(command):
         st.error(f"Command error: {e.stderr}")
         return None
 
+# Database functions
+def save_job_to_db(job_info):
+    """Save job information to the database"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        "INSERT OR REPLACE INTO jobs (job_id, job_name, start_time, status, args) VALUES (?, ?, ?, ?, ?)",
+        (
+            job_info['job_id'],
+            job_info['job_name'],
+            job_info['start_time'],
+            job_info['status'],
+            json.dumps(job_info['args'])
+        )
+    )
+    
+    conn.commit()
+    conn.close()
+
+def update_job_status_in_db(job_id, status):
+    """Update job status in the database"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        "UPDATE jobs SET status = ? WHERE job_id = ?",
+        (status, job_id)
+    )
+    
+    conn.commit()
+    conn.close()
+
+def save_output_files_to_db(job_id, files):
+    """Save output files information to the database"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Delete existing files for this job
+    cursor.execute("DELETE FROM output_files WHERE job_id = ?", (job_id,))
+    
+    # Insert new files
+    for file in files:
+        cursor.execute(
+            "INSERT INTO output_files (job_id, file_path, file_size) VALUES (?, ?, ?)",
+            (job_id, file['path'], file['size'])
+        )
+    
+    conn.commit()
+    conn.close()
+
+def get_jobs_from_db():
+    """Get all jobs from the database"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM jobs ORDER BY start_time DESC")
+    rows = cursor.fetchall()
+    
+    jobs = []
+    for row in rows:
+        jobs.append({
+            'job_id': row['job_id'],
+            'job_name': row['job_name'],
+            'start_time': row['start_time'],
+            'status': row['status'],
+            'args': json.loads(row['args'])
+        })
+    
+    conn.close()
+    return jobs
+
+def get_output_files_from_db(job_id):
+    """Get output files for a specific job from the database"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM output_files WHERE job_id = ?", (job_id,))
+    rows = cursor.fetchall()
+    
+    files = []
+    for row in rows:
+        files.append({
+            'path': row['file_path'],
+            'size': row['file_size']
+        })
+    
+    conn.close()
+    return files
+
 # Function to start a batch inference job
 def start_job(job_args):
     args_json = json.dumps(job_args)
@@ -64,7 +189,7 @@ def start_job(job_args):
         job_id = result['JobRunId']
         job_name = 'intelligent-bedrock-batch-inference'
         
-        # Add job to session state
+        # Create job info
         job_info = {
             'job_id': job_id,
             'job_name': job_name,
@@ -73,11 +198,8 @@ def start_job(job_args):
             'args': job_args
         }
         
-        st.session_state.jobs.append(job_info)
-        st.session_state.job_details[job_id] = {
-            'info': job_info,
-            'output_files': []
-        }
+        # Save to database
+        save_job_to_db(job_info)
         
         return job_id
     return None
@@ -88,16 +210,19 @@ def get_job_status(job_name, job_id):
     result = run_aws_command(command)
     
     if result and 'JobRun' in result:
+        status = result['JobRun']['JobRunState']
+        
+        # Update status in database
+        update_job_status_in_db(job_id, status)
+        
         return {
-            'status': result['JobRun']['JobRunState'],
+            'status': status,
             'start_time': result['JobRun'].get('StartedOn', ''),
             'end_time': result['JobRun'].get('CompletedOn', ''),
             'error_message': result['JobRun'].get('ErrorMessage', ''),
             'execution_time': result['JobRun'].get('ExecutionTime', 0)
         }
     return {'status': 'UNKNOWN'}
-
-# Removed get_job_logs function
 
 # Function to list S3 output files
 def list_s3_output_files(output_uri):
@@ -143,12 +268,8 @@ def list_s3_output_files(output_uri):
         st.error(f"Error listing S3 files: {e}")
         return []
 
-# Removed refresh_job_statuses function
-
 # Main app layout
 st.title("🤖 Intelligent Bedrock Batch Inference")
-
-# No sidebar for AWS configuration - using local credentials automatically
 
 # Create tabs
 tab1, tab2 = st.tabs(["Start Job", "Job Tracker"])
@@ -278,32 +399,34 @@ with tab2:
     
     # Refresh button
     if st.button("🔄 Refresh"):
-        for job in st.session_state.jobs:
+        # Get all jobs from database
+        jobs = get_jobs_from_db()
+        
+        # Update job statuses
+        for job in jobs:
             job_id = job['job_id']
             job_name = job['job_name']
             
             # Update job status
             status_info = get_job_status(job_name, job_id)
-            job['status'] = status_info['status']
             
-            # Update job details
-            if job_id in st.session_state.job_details:
-                st.session_state.job_details[job_id]['info']['status'] = status_info['status']
-                
-                # If job completed, get output files
-                if status_info['status'] in ['SUCCEEDED', 'FAILED', 'TIMEOUT', 'STOPPED']:
-                    output_uri = job['args'].get('--output_s3_uri', '')
-                    if output_uri:
-                        files = list_s3_output_files(output_uri)
-                        st.session_state.job_details[job_id]['output_files'] = files
+            # If job completed, get output files
+            if status_info['status'] in ['SUCCEEDED', 'FAILED', 'TIMEOUT', 'STOPPED']:
+                output_uri = job['args'].get('--output_s3_uri', '')
+                if output_uri:
+                    files = list_s3_output_files(output_uri)
+                    save_output_files_to_db(job_id, files)
+    
+    # Get jobs from database
+    jobs = get_jobs_from_db()
     
     # Display jobs table
-    if not st.session_state.jobs:
+    if not jobs:
         st.info("No jobs have been started yet. Use the 'Start Job' tab to begin.")
     else:
         # Create DataFrame for jobs
         jobs_data = []
-        for job in st.session_state.jobs:
+        for job in jobs:
             jobs_data.append({
                 'Job ID': job['job_id'],
                 'Start Time': job['start_time'],
@@ -316,7 +439,7 @@ with tab2:
         
         # Job details expander
         st.subheader("Job Details")
-        for job in st.session_state.jobs:
+        for job in jobs:
             job_id = job['job_id']
             
             with st.expander(f"Job {job_id} - Status: {job['status']}"):
@@ -331,21 +454,17 @@ with tab2:
                 
                 # Output files
                 st.write("**Output Files**")
-                if job_id in st.session_state.job_details and st.session_state.job_details[job_id].get('output_files'):
-                    files = st.session_state.job_details[job_id]['output_files']
-                    if files:
-                        files_df = pd.DataFrame(files)
-                        st.dataframe(files_df, use_container_width=True)
-                    else:
-                        st.info("No output files found yet.")
+                files = get_output_files_from_db(job_id)
+                
+                if files:
+                    files_df = pd.DataFrame(files)
+                    st.dataframe(files_df, use_container_width=True)
                 else:
                     output_uri = job['args'].get('--output_s3_uri', '')
                     if output_uri and job['status'] in ['SUCCEEDED', 'FAILED', 'TIMEOUT', 'STOPPED']:
                         files = list_s3_output_files(output_uri)
-                        if job_id in st.session_state.job_details:
-                            st.session_state.job_details[job_id]['output_files'] = files
-                        
                         if files:
+                            save_output_files_to_db(job_id, files)
                             files_df = pd.DataFrame(files)
                             st.dataframe(files_df, use_container_width=True)
                         else:
@@ -358,7 +477,7 @@ st.markdown("---")
 st.markdown("### About")
 st.markdown("""
 This application provides a user interface for running batch inference jobs using Amazon Bedrock through AWS Glue.
-It allows you to start jobs, track their status, and view results.
+It allows you to start jobs, track their status, and view results. All job information is persisted in a SQLite database.
 
 For more information, refer to the [GitHub repository](https://github.com/yourusername/intelligent-bedrock-batch-inference).
 """)

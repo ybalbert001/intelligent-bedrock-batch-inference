@@ -48,3 +48,6 @@ Thumbs.db
 
 # AWS
 .aws/
+jobs.db
+temp/
+temp_data/

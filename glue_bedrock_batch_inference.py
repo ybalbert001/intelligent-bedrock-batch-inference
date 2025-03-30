@@ -313,8 +313,11 @@ class BedrockBatchInference:
             payload = {
                 "inputs": record,
                 "response_mode": "blocking",
-                "user": "batch_inference"
+                "user": f"{record_id}"
             }
+            print("payload:")
+            print(payload)
+
             # Log request details
             print(f"Processing record {record_id} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"Current thread: {threading.current_thread().name}")
