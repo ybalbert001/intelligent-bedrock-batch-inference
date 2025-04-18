@@ -332,7 +332,8 @@ class BedrockBatchInference:
             return {
                 'modelInput': record,
                 'modelOutput': result["data"]['outputs'],
-                'recordId': record_id
+                'recordId': record_id,
+                'total_tokens': result["data"]["total_tokens"]
             }
         except Exception as e:
             print(f"exception: {e}")
@@ -341,7 +342,8 @@ class BedrockBatchInference:
                 'modelOutput': {
                     'error': str(e)
                 },
-                'recordId': record_id
+                'recordId': record_id,
+                'total_tokens': 0
             }
         
     def process_batch(self, records: List[Dict], max_workers: int) -> List[Dict]:
